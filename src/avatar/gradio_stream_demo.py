@@ -26,6 +26,7 @@ from flash_talk.inference import (
 _PIPELINE_CACHE = {}
 _DIST_FIXED_CKPT_DIR = ""
 _DIST_FIXED_WAV2VEC_DIR = ""
+_DIST_GLOO_GROUP = None
 
 
 def _get_dist_info():
@@ -37,6 +38,27 @@ def _get_dist_info():
 def _is_dist_enabled():
     world_size, _ = _get_dist_info()
     return world_size > 1 and dist.is_available()
+
+
+def _get_object_group():
+    if not dist.is_initialized():
+        return None
+    backend = dist.get_backend()
+    if backend == "gloo":
+        return dist.group.WORLD
+    global _DIST_GLOO_GROUP
+    if _DIST_GLOO_GROUP is None:
+        try:
+            _DIST_GLOO_GROUP = dist.new_group(backend="gloo")
+        except Exception as exc:
+            logger.warning("Failed to create gloo group, falling back to WORLD: {}", exc)
+            _DIST_GLOO_GROUP = dist.group.WORLD
+    return _DIST_GLOO_GROUP
+
+
+def _init_object_group():
+    if _is_dist_enabled() and dist.is_initialized():
+        _get_object_group()
 
 
 def _get_pipeline_cached(ckpt_dir, wav2vec_dir):
@@ -107,8 +129,9 @@ def _merge_audio_video(video_path, audio_path, output_path):
 def _broadcast_request(payload):
     if not _is_dist_enabled() or not dist.is_initialized():
         return
+    group = _get_object_group()
     obj_list = [payload]
-    dist.broadcast_object_list(obj_list, src=0)
+    dist.broadcast_object_list(obj_list, src=0, group=group)
 
 
 def _stream_job(
@@ -253,9 +276,10 @@ def stream_generate(
 
 def _worker_loop():
     logger.info("Multi-GPU worker ready, waiting for requests.")
+    group = _get_object_group()
     while True:
         payload_list = [None]
-        dist.broadcast_object_list(payload_list, src=0)
+        dist.broadcast_object_list(payload_list, src=0, group=group)
         payload = payload_list[0]
         if payload is None or payload.get("cmd") == "shutdown":
             return
@@ -371,6 +395,7 @@ if __name__ == "__main__":
         _DIST_FIXED_CKPT_DIR = args.ckpt_dir
         _DIST_FIXED_WAV2VEC_DIR = args.wav2vec_dir
         _get_pipeline_cached(args.ckpt_dir, args.wav2vec_dir)
+        _init_object_group()
 
     if world_size > 1 and rank != 0:
         _worker_loop()
