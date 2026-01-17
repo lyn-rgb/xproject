@@ -124,6 +124,11 @@ python gradio_stream_demo.py \
   --wav2vec_dir ./models/chinese-wav2vec2-base
 ```
 
+### 🧪 Gradio Streaming Demo (Multi-GPU)
+```bash
+bash inference_script_multi_gpu_gradio.sh
+```
+
 ### 👋 Online Demo 
 Coming Soon!
 

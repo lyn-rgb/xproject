@@ -12,6 +12,7 @@ import imageio
 import librosa
 import numpy as np
 import torch
+import torch.distributed as dist
 from loguru import logger
 
 from flash_talk.inference import (
@@ -23,13 +24,27 @@ from flash_talk.inference import (
 )
 
 _PIPELINE_CACHE = {}
+_DIST_FIXED_CKPT_DIR = ""
+_DIST_FIXED_WAV2VEC_DIR = ""
+
+
+def _get_dist_info():
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank = int(os.environ.get("RANK", 0))
+    return world_size, rank
+
+
+def _is_dist_enabled():
+    world_size, _ = _get_dist_info()
+    return world_size > 1 and dist.is_available()
 
 
 def _get_pipeline_cached(ckpt_dir, wav2vec_dir):
     cache_key = (ckpt_dir, wav2vec_dir)
     if cache_key in _PIPELINE_CACHE:
         return _PIPELINE_CACHE[cache_key]
-    pipeline = get_pipeline(world_size=1, ckpt_dir=ckpt_dir, wav2vec_dir=wav2vec_dir)
+    world_size, _ = _get_dist_info()
+    pipeline = get_pipeline(world_size=world_size, ckpt_dir=ckpt_dir, wav2vec_dir=wav2vec_dir)
     _PIPELINE_CACHE[cache_key] = pipeline
     return pipeline
 
@@ -74,8 +89,10 @@ def _merge_audio_video(video_path, audio_path, output_path):
         video_path,
         "-i",
         audio_path,
-        "-c",
+        "-c:v",
         "copy",
+        "-c:a",
+        "aac",
         "-shortest",
         output_path,
         "-y",
@@ -87,7 +104,14 @@ def _merge_audio_video(video_path, audio_path, output_path):
     return output_path
 
 
-def stream_generate(
+def _broadcast_request(payload):
+    if not _is_dist_enabled() or not dist.is_initialized():
+        return
+    obj_list = [payload]
+    dist.broadcast_object_list(obj_list, src=0)
+
+
+def _stream_job(
     ckpt_dir,
     wav2vec_dir,
     input_prompt,
@@ -95,14 +119,9 @@ def stream_generate(
     audio_path,
     audio_encode_mode,
     base_seed,
+    write_video,
+    stream_output,
 ):
-    if not ckpt_dir or not wav2vec_dir:
-        raise gr.Error("Please set both ckpt_dir and wav2vec_dir.")
-    if not cond_image_path or not os.path.exists(cond_image_path):
-        raise gr.Error("Please upload a valid condition image.")
-    if not audio_path or not os.path.exists(audio_path):
-        raise gr.Error("Please upload a valid audio file.")
-
     base_seed = base_seed if base_seed >= 0 else 9999
     pipeline = _get_pipeline_cached(ckpt_dir, wav2vec_dir)
     get_base_data(
@@ -116,23 +135,28 @@ def stream_generate(
     tgt_fps = infer_params["tgt_fps"]
     audio_array, _ = librosa.load(audio_path, sr=sample_rate, mono=True)
 
-    output_dir = "sample_results"
-    os.makedirs(output_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d-%H:%M:%S-%f")[:-3]
-    final_output_path = os.path.join(output_dir, f"res_{timestamp}.mp4")
+    final_output_path = None
+    temp_video_path = None
+    writer = None
+    if write_video:
+        output_dir = "sample_results"
+        os.makedirs(output_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H:%M:%S-%f")[:-3]
+        final_output_path = os.path.join(output_dir, f"res_{timestamp}.mp4")
 
-    temp_dir = tempfile.mkdtemp(prefix="flashtalk_stream_")
-    temp_video_path = os.path.join(temp_dir, "temp_video.mp4")
+        temp_dir = tempfile.mkdtemp(prefix="flashtalk_stream_")
+        temp_video_path = os.path.join(temp_dir, "temp_video.mp4")
+
+        writer = imageio.get_writer(
+            temp_video_path,
+            format="mp4",
+            mode="I",
+            fps=tgt_fps,
+            codec="h264",
+            ffmpeg_params=["-bf", "0"],
+        )
 
     last_frame = None
-    writer = imageio.get_writer(
-        temp_video_path,
-        format="mp4",
-        mode="I",
-        fps=tgt_fps,
-        codec="h264",
-        ffmpeg_params=["-bf", "0"],
-    )
     try:
         for chunk_idx, audio_embedding in enumerate(
             _iter_audio_embeddings(pipeline, audio_array, audio_encode_mode)
@@ -153,39 +177,122 @@ def stream_generate(
                 end_time - start_time,
             )
 
-            frames = video.detach().cpu().numpy().astype(np.uint8)
-            for frame in frames:
-                writer.append_data(frame)
-                last_frame = frame
-                yield frame, None
+            if write_video or stream_output:
+                frames = video.detach().cpu().numpy().astype(np.uint8)
+                for frame in frames:
+                    if write_video:
+                        writer.append_data(frame)
+                    last_frame = frame
+                    if stream_output:
+                        yield frame, None
     finally:
-        writer.close()
+        if writer is not None:
+            writer.close()
+
+    if not write_video:
+        if _is_dist_enabled() and dist.is_initialized():
+            dist.barrier()
+        return
 
     if last_frame is None:
         raise gr.Error("No frames generated. Please check your inputs.")
 
     merged_path = _merge_audio_video(temp_video_path, audio_path, final_output_path)
     final_video_path = merged_path or temp_video_path
+    if _is_dist_enabled() and dist.is_initialized():
+        dist.barrier()
     yield last_frame, final_video_path
 
 
-def build_demo(default_ckpt_dir, default_wav2vec_dir):
+def stream_generate(
+    ckpt_dir,
+    wav2vec_dir,
+    input_prompt,
+    cond_image_path,
+    audio_path,
+    audio_encode_mode,
+    base_seed,
+):
+    if not ckpt_dir or not wav2vec_dir:
+        raise gr.Error("Please set both ckpt_dir and wav2vec_dir.")
+    if not cond_image_path or not os.path.exists(cond_image_path):
+        raise gr.Error("Please upload a valid condition image.")
+    if not audio_path or not os.path.exists(audio_path):
+        raise gr.Error("Please upload a valid audio file.")
+
+    if _is_dist_enabled():
+        if _DIST_FIXED_CKPT_DIR:
+            ckpt_dir = _DIST_FIXED_CKPT_DIR
+        if _DIST_FIXED_WAV2VEC_DIR:
+            wav2vec_dir = _DIST_FIXED_WAV2VEC_DIR
+        _broadcast_request(
+            {
+                "cmd": "start",
+                "ckpt_dir": ckpt_dir,
+                "wav2vec_dir": wav2vec_dir,
+                "input_prompt": input_prompt,
+                "cond_image_path": cond_image_path,
+                "audio_path": audio_path,
+                "audio_encode_mode": audio_encode_mode,
+                "base_seed": base_seed,
+            }
+        )
+
+    yield from _stream_job(
+        ckpt_dir=ckpt_dir,
+        wav2vec_dir=wav2vec_dir,
+        input_prompt=input_prompt,
+        cond_image_path=cond_image_path,
+        audio_path=audio_path,
+        audio_encode_mode=audio_encode_mode,
+        base_seed=base_seed,
+        write_video=True,
+        stream_output=True,
+    )
+
+
+def _worker_loop():
+    logger.info("Multi-GPU worker ready, waiting for requests.")
+    while True:
+        payload_list = [None]
+        dist.broadcast_object_list(payload_list, src=0)
+        payload = payload_list[0]
+        if payload is None or payload.get("cmd") == "shutdown":
+            return
+        _stream_job(
+            ckpt_dir=payload["ckpt_dir"],
+            wav2vec_dir=payload["wav2vec_dir"],
+            input_prompt=payload["input_prompt"],
+            cond_image_path=payload["cond_image_path"],
+            audio_path=payload["audio_path"],
+            audio_encode_mode=payload["audio_encode_mode"],
+            base_seed=payload["base_seed"],
+            write_video=False,
+            stream_output=False,
+        )
+
+
+def build_demo(default_ckpt_dir, default_wav2vec_dir, multi_gpu):
     with gr.Blocks(title="SoulX-FlashTalk Streaming Demo") as demo:
         gr.Markdown(
             "# SoulX-FlashTalk Streaming Demo\n"
             "Upload a condition image and an audio clip to stream frames as they are generated."
         )
+        if multi_gpu:
+            gr.Markdown("Multi-GPU mode enabled. Use CLI args to set model paths.")
         with gr.Row():
             with gr.Column(scale=1):
                 ckpt_dir = gr.Textbox(
                     label="Checkpoint dir",
                     value=default_ckpt_dir,
                     placeholder="models/SoulX-FlashTalk-14B",
+                    interactive=not multi_gpu,
                 )
                 wav2vec_dir = gr.Textbox(
                     label="Wav2Vec dir",
                     value=default_wav2vec_dir,
                     placeholder="models/chinese-wav2vec2-base",
+                    interactive=not multi_gpu,
                 )
                 input_prompt = gr.Textbox(
                     label="Prompt",
@@ -238,7 +345,10 @@ def build_demo(default_ckpt_dir, default_wav2vec_dir):
             outputs=[stream_frame, final_video],
         )
 
-    demo.queue(concurrency_count=1, max_size=2)
+    try:
+        demo.queue(concurrency_count=1, max_size=2)
+    except TypeError:
+        demo.queue(max_size=2)
     return demo
 
 
@@ -253,5 +363,17 @@ def _parse_args():
 
 if __name__ == "__main__":
     args = _parse_args()
-    app = build_demo(args.ckpt_dir, args.wav2vec_dir)
-    app.launch(server_name=args.host, server_port=args.port)
+    world_size, rank = _get_dist_info()
+    if world_size > 1 and (not args.ckpt_dir or not args.wav2vec_dir):
+        raise SystemExit("Multi-GPU requires --ckpt_dir and --wav2vec_dir.")
+
+    if world_size > 1:
+        _DIST_FIXED_CKPT_DIR = args.ckpt_dir
+        _DIST_FIXED_WAV2VEC_DIR = args.wav2vec_dir
+        _get_pipeline_cached(args.ckpt_dir, args.wav2vec_dir)
+
+    if world_size > 1 and rank != 0:
+        _worker_loop()
+    else:
+        app = build_demo(args.ckpt_dir, args.wav2vec_dir, world_size > 1)
+        app.launch(server_name=args.host, server_port=args.port)
