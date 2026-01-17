@@ -12,6 +12,7 @@ import gradio as gr
 import librosa
 import numpy as np
 import torch
+import torch.distributed as dist
 from fastapi import HTTPException, Request
 from loguru import logger
 
@@ -23,6 +24,8 @@ from flash_talk.inference import (
     infer_params,
 )
 
+_PIPELINE_CACHE = {}
+_DIST_GLOO_GROUP = None
 _FRTC_BACKEND = os.path.abspath(
     os.path.join(
         os.path.dirname(__file__),
@@ -50,6 +53,43 @@ _VIDEO_QUEUE = queue.Queue(maxsize=512)
 _AUDIO_QUEUE = queue.Queue(maxsize=8192)
 _GEN_LOCK = threading.Lock()
 _GEN_THREAD: threading.Thread | None = None
+
+
+def _get_dist_info():
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank = int(os.environ.get("RANK", 0))
+    return world_size, rank
+
+
+def _is_dist_enabled():
+    world_size, _ = _get_dist_info()
+    return world_size > 1 and dist.is_available()
+
+
+def _get_object_group():
+    if not dist.is_initialized():
+        return None
+    backend = dist.get_backend()
+    if backend == "gloo":
+        return dist.group.WORLD
+    global _DIST_GLOO_GROUP
+    if _DIST_GLOO_GROUP is None:
+        try:
+            _DIST_GLOO_GROUP = dist.new_group(backend="gloo")
+        except Exception as exc:
+            logger.warning("Failed to create gloo group, falling back to WORLD: {}", exc)
+            _DIST_GLOO_GROUP = dist.group.WORLD
+    return _DIST_GLOO_GROUP
+
+
+def _get_pipeline_cached(ckpt_dir, wav2vec_dir):
+    cache_key = (ckpt_dir, wav2vec_dir)
+    if cache_key in _PIPELINE_CACHE:
+        return _PIPELINE_CACHE[cache_key]
+    world_size, _ = _get_dist_info()
+    pipeline = get_pipeline(world_size=world_size, ckpt_dir=ckpt_dir, wav2vec_dir=wav2vec_dir)
+    _PIPELINE_CACHE[cache_key] = pipeline
+    return pipeline
 
 
 def _rtc_output_frame_size(sample_rate):
@@ -166,18 +206,13 @@ def _iter_audio_embeddings(pipeline, audio_array, audio_encode_mode):
         yield get_audio_embedding(pipeline, audio_window, audio_start_idx, audio_end_idx), audio_slice
 
 
-def _run_generation(payload):
+def _run_generation(payload, stream_output):
     with _GEN_LOCK:
-        _clear_queues()
+        if stream_output:
+            _clear_queues()
         sample_rate = infer_params["sample_rate"]
         tgt_fps = infer_params["tgt_fps"]
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
-
-        pipeline = get_pipeline(
-            world_size=world_size,
-            ckpt_dir=payload["ckpt_dir"],
-            wav2vec_dir=payload["wav2vec_dir"],
-        )
+        pipeline = _get_pipeline_cached(payload["ckpt_dir"], payload["wav2vec_dir"])
         get_base_data(
             pipeline,
             input_prompt=payload["input_prompt"],
@@ -189,7 +224,8 @@ def _run_generation(payload):
         for chunk_idx, (audio_embedding, audio_chunk) in enumerate(
             _iter_audio_embeddings(pipeline, audio_array, payload["audio_encode_mode"])
         ):
-            _enqueue_audio(audio_chunk, sample_rate)
+            if stream_output:
+                _enqueue_audio(audio_chunk, sample_rate)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             start_time = time.time()
@@ -203,19 +239,46 @@ def _run_generation(payload):
                 chunk_idx,
                 end_time - start_time,
             )
-            frames = video.detach().cpu().numpy().astype(np.uint8)
-            for frame in frames:
-                _enqueue_video(np.ascontiguousarray(frame))
-            time.sleep(1.0 / max(tgt_fps, 1))
+            if stream_output:
+                frames = video.detach().cpu().numpy().astype(np.uint8)
+                for frame in frames:
+                    _enqueue_video(np.ascontiguousarray(frame))
+                time.sleep(1.0 / max(tgt_fps, 1))
+        if _is_dist_enabled() and dist.is_initialized():
+            dist.barrier()
 
 
 def _start_generation(payload):
     global _GEN_THREAD
     if _GEN_THREAD is not None and _GEN_THREAD.is_alive():
         return False
-    _GEN_THREAD = threading.Thread(target=_run_generation, args=(payload,), daemon=True)
+    _GEN_THREAD = threading.Thread(
+        target=_run_generation,
+        args=(payload, True),
+        daemon=True,
+    )
     _GEN_THREAD.start()
     return True
+
+
+def _broadcast_request(payload):
+    if not _is_dist_enabled() or not dist.is_initialized():
+        return
+    group = _get_object_group()
+    obj_list = [payload]
+    dist.broadcast_object_list(obj_list, src=0, group=group)
+
+
+def _worker_loop():
+    logger.info("RTC worker ready, waiting for requests.")
+    group = _get_object_group()
+    while True:
+        payload_list = [None]
+        dist.broadcast_object_list(payload_list, src=0, group=group)
+        payload = payload_list[0]
+        if payload is None or payload.get("cmd") == "shutdown":
+            return
+        _run_generation(payload, False)
 
 
 def build_app(default_ckpt_dir, default_wav2vec_dir):
@@ -243,6 +306,7 @@ def build_app(default_ckpt_dir, default_wav2vec_dir):
     @demo.app.post("/start")
     async def start_stream(request: Request):
         payload = await request.json()
+        payload["cmd"] = "start"
         payload.setdefault("ckpt_dir", default_ckpt_dir)
         payload.setdefault("wav2vec_dir", default_wav2vec_dir)
         payload.setdefault("input_prompt", "A person is talking.")
@@ -256,6 +320,11 @@ def build_app(default_ckpt_dir, default_wav2vec_dir):
         if not payload.get("audio_path") or not os.path.exists(payload["audio_path"]):
             raise HTTPException(status_code=400, detail="audio_path invalid")
 
+        if _is_dist_enabled() and not dist.is_initialized():
+            _get_pipeline_cached(payload["ckpt_dir"], payload["wav2vec_dir"])
+            _get_object_group()
+        if _is_dist_enabled() and dist.is_initialized():
+            _broadcast_request(payload)
         if not _start_generation(payload):
             raise HTTPException(status_code=409, detail="generation already running")
         return {"status": "started"}
@@ -274,5 +343,13 @@ def _parse_args():
 
 if __name__ == "__main__":
     args = _parse_args()
-    app = build_app(args.ckpt_dir, args.wav2vec_dir)
-    app.launch(server_name=args.host, server_port=args.port)
+    world_size, rank = _get_dist_info()
+    if world_size > 1 and (not args.ckpt_dir or not args.wav2vec_dir):
+        raise SystemExit("Multi-GPU requires --ckpt_dir and --wav2vec_dir.")
+    if world_size > 1 and rank != 0:
+        _get_pipeline_cached(args.ckpt_dir, args.wav2vec_dir)
+        _get_object_group()
+        _worker_loop()
+    else:
+        app = build_app(args.ckpt_dir, args.wav2vec_dir)
+        app.launch(server_name=args.host, server_port=args.port)

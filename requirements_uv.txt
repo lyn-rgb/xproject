@@ -1,0 +1,32 @@
+# Core deps for avatar + thinker demos.
+# Install torch separately to match your CUDA/Metal runtime.
+accelerate
+av
+decord
+diffusers>=0.34.0
+easydict
+ffmpeg==1.4
+ffmpeg-python==0.2.0
+ftfy
+gradio==5.23.1
+gradio_client==1.8.0
+imageio
+imageio-ffmpeg
+librosa==0.11.0
+loguru
+modelscope_studio==1.2.2
+numpy
+opencv-python>=4.12.0.88
+opencv-python-headless>=4.12.0.88
+optimum-quanto==0.2.6
+pyloudnorm
+qwen-omni-utils==0.0.4
+requests
+scikit-image
+soundfile==0.13.1
+tokenizers>=0.20.3
+torchvision
+tqdm
+transformers==4.52.3
+xfuser>=0.4.3
+xformers==0.0.31
