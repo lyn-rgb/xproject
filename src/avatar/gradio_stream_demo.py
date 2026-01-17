@@ -1,0 +1,257 @@
+# Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import argparse
+import os
+import subprocess
+import tempfile
+import time
+from collections import deque
+from datetime import datetime
+
+import gradio as gr
+import imageio
+import librosa
+import numpy as np
+import torch
+from loguru import logger
+
+from flash_talk.inference import (
+    get_pipeline,
+    get_base_data,
+    get_audio_embedding,
+    run_pipeline,
+    infer_params,
+)
+
+_PIPELINE_CACHE = {}
+
+
+def _get_pipeline_cached(ckpt_dir, wav2vec_dir):
+    cache_key = (ckpt_dir, wav2vec_dir)
+    if cache_key in _PIPELINE_CACHE:
+        return _PIPELINE_CACHE[cache_key]
+    pipeline = get_pipeline(world_size=1, ckpt_dir=ckpt_dir, wav2vec_dir=wav2vec_dir)
+    _PIPELINE_CACHE[cache_key] = pipeline
+    return pipeline
+
+
+def _iter_audio_embeddings(pipeline, audio_array, audio_encode_mode):
+    sample_rate = infer_params["sample_rate"]
+    tgt_fps = infer_params["tgt_fps"]
+    frame_num = infer_params["frame_num"]
+    motion_frames_num = infer_params["motion_frames_num"]
+    slice_len = frame_num - motion_frames_num
+
+    if audio_encode_mode == "once":
+        audio_embedding_all = get_audio_embedding(pipeline, audio_array)
+        total_chunks = (audio_embedding_all.shape[1] - frame_num) // slice_len
+        for i in range(total_chunks):
+            yield audio_embedding_all[
+                :,
+                i * slice_len : i * slice_len + frame_num,
+            ].contiguous()
+        return
+
+    cached_audio_duration = infer_params["cached_audio_duration"]
+    cached_audio_length_sum = sample_rate * cached_audio_duration
+    audio_end_idx = cached_audio_duration * tgt_fps
+    audio_start_idx = audio_end_idx - frame_num
+
+    audio_dq = deque([0.0] * cached_audio_length_sum, maxlen=cached_audio_length_sum)
+    audio_slice_len = slice_len * sample_rate // tgt_fps
+    audio_slices = audio_array[: (len(audio_array) // audio_slice_len) * audio_slice_len]
+    audio_slices = audio_slices.reshape(-1, audio_slice_len)
+
+    for audio_slice in audio_slices:
+        audio_dq.extend(audio_slice.tolist())
+        audio_window = np.array(audio_dq)
+        yield get_audio_embedding(pipeline, audio_window, audio_start_idx, audio_end_idx)
+
+
+def _merge_audio_video(video_path, audio_path, output_path):
+    cmd = [
+        "ffmpeg",
+        "-i",
+        video_path,
+        "-i",
+        audio_path,
+        "-c",
+        "copy",
+        "-shortest",
+        output_path,
+        "-y",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.warning("ffmpeg merge failed: {}", result.stderr.strip())
+        return None
+    return output_path
+
+
+def stream_generate(
+    ckpt_dir,
+    wav2vec_dir,
+    input_prompt,
+    cond_image_path,
+    audio_path,
+    audio_encode_mode,
+    base_seed,
+):
+    if not ckpt_dir or not wav2vec_dir:
+        raise gr.Error("Please set both ckpt_dir and wav2vec_dir.")
+    if not cond_image_path or not os.path.exists(cond_image_path):
+        raise gr.Error("Please upload a valid condition image.")
+    if not audio_path or not os.path.exists(audio_path):
+        raise gr.Error("Please upload a valid audio file.")
+
+    base_seed = base_seed if base_seed >= 0 else 9999
+    pipeline = _get_pipeline_cached(ckpt_dir, wav2vec_dir)
+    get_base_data(
+        pipeline,
+        input_prompt=input_prompt,
+        cond_image=cond_image_path,
+        base_seed=base_seed,
+    )
+
+    sample_rate = infer_params["sample_rate"]
+    tgt_fps = infer_params["tgt_fps"]
+    audio_array, _ = librosa.load(audio_path, sr=sample_rate, mono=True)
+
+    output_dir = "sample_results"
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H:%M:%S-%f")[:-3]
+    final_output_path = os.path.join(output_dir, f"res_{timestamp}.mp4")
+
+    temp_dir = tempfile.mkdtemp(prefix="flashtalk_stream_")
+    temp_video_path = os.path.join(temp_dir, "temp_video.mp4")
+
+    last_frame = None
+    writer = imageio.get_writer(
+        temp_video_path,
+        format="mp4",
+        mode="I",
+        fps=tgt_fps,
+        codec="h264",
+        ffmpeg_params=["-bf", "0"],
+    )
+    try:
+        for chunk_idx, audio_embedding in enumerate(
+            _iter_audio_embeddings(pipeline, audio_array, audio_encode_mode)
+        ):
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            start_time = time.time()
+
+            with torch.inference_mode():
+                video = run_pipeline(pipeline, audio_embedding)
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            end_time = time.time()
+            logger.info(
+                "Generate video chunk-{} done, cost time: {:.2f}s",
+                chunk_idx,
+                end_time - start_time,
+            )
+
+            frames = video.detach().cpu().numpy().astype(np.uint8)
+            for frame in frames:
+                writer.append_data(frame)
+                last_frame = frame
+                yield frame, None
+    finally:
+        writer.close()
+
+    if last_frame is None:
+        raise gr.Error("No frames generated. Please check your inputs.")
+
+    merged_path = _merge_audio_video(temp_video_path, audio_path, final_output_path)
+    final_video_path = merged_path or temp_video_path
+    yield last_frame, final_video_path
+
+
+def build_demo(default_ckpt_dir, default_wav2vec_dir):
+    with gr.Blocks(title="SoulX-FlashTalk Streaming Demo") as demo:
+        gr.Markdown(
+            "# SoulX-FlashTalk Streaming Demo\n"
+            "Upload a condition image and an audio clip to stream frames as they are generated."
+        )
+        with gr.Row():
+            with gr.Column(scale=1):
+                ckpt_dir = gr.Textbox(
+                    label="Checkpoint dir",
+                    value=default_ckpt_dir,
+                    placeholder="models/SoulX-FlashTalk-14B",
+                )
+                wav2vec_dir = gr.Textbox(
+                    label="Wav2Vec dir",
+                    value=default_wav2vec_dir,
+                    placeholder="models/chinese-wav2vec2-base",
+                )
+                input_prompt = gr.Textbox(
+                    label="Prompt",
+                    value=(
+                        "A person is talking. Only the foreground characters are moving, "
+                        "the background remains static."
+                    ),
+                )
+                base_seed = gr.Number(label="Base seed", value=9999, precision=0)
+                cond_image = gr.Image(
+                    label="Condition image",
+                    type="filepath",
+                    value="examples/man.png",
+                )
+                audio = gr.Audio(
+                    label="Audio",
+                    type="filepath",
+                    value="examples/cantonese_16k.wav",
+                )
+                audio_encode_mode = gr.Dropdown(
+                    label="Audio encode mode",
+                    choices=["stream", "once"],
+                    value="stream",
+                )
+                run_btn = gr.Button("Generate (Stream)")
+
+            with gr.Column(scale=1):
+                stream_frame = gr.Image(
+                    label="Live frame",
+                    streaming=True,
+                    show_label=True,
+                )
+                final_video = gr.Video(
+                    label="Final video",
+                    format="mp4",
+                    show_label=True,
+                )
+
+        run_btn.click(
+            stream_generate,
+            inputs=[
+                ckpt_dir,
+                wav2vec_dir,
+                input_prompt,
+                cond_image,
+                audio,
+                audio_encode_mode,
+                base_seed,
+            ],
+            outputs=[stream_frame, final_video],
+        )
+
+    demo.queue(concurrency_count=1, max_size=2)
+    return demo
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="SoulX-FlashTalk Gradio streaming demo.")
+    parser.add_argument("--ckpt_dir", type=str, default="", help="FlashTalk checkpoint dir.")
+    parser.add_argument("--wav2vec_dir", type=str, default="", help="Wav2Vec checkpoint dir.")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Gradio host.")
+    parser.add_argument("--port", type=int, default=7860, help="Gradio port.")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = _parse_args()
+    app = build_demo(args.ckpt_dir, args.wav2vec_dir)
+    app.launch(server_name=args.host, server_port=args.port)
