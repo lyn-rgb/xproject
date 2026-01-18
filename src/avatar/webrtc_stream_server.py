@@ -284,13 +284,21 @@ def _worker_loop():
 def build_app(default_ckpt_dir, default_wav2vec_dir):
     with gr.Blocks(title="FlashTalk WebRTC Stream") as demo:
         gr.Markdown("WebRTC streaming server (video + audio). Trigger generation via POST /start.")
-        webrtc = WebRTC(
-            label="WebRTC Stream",
-            modality="audio-video",
-            mode="send-receive",
-            video_chat=True,
-            elem_id="rtc-output",
-        )
+        try:
+            webrtc = WebRTC(
+                label="WebRTC Stream",
+                modality="audio-video",
+                mode="send-receive",
+                video_chat=True,
+                elem_id="rtc-output",
+            )
+        except TypeError:
+            webrtc = WebRTC(
+                label="WebRTC Stream",
+                modality="audio-video",
+                mode="send-receive",
+                elem_id="rtc-output",
+            )
         handler = FlashTalkRTCHandler(
             output_sample_rate=infer_params["sample_rate"],
             fps=infer_params["tgt_fps"],

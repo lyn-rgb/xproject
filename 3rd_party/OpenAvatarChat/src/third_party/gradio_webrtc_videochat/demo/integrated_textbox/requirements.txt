@@ -1,2 +1,0 @@
-fastrtc[vad, stt]
-openai
