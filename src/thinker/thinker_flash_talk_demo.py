@@ -1,10 +1,14 @@
 import argparse
+import atexit
 import os
 import sys
+import subprocess
+import wave
 import time
 from typing import Optional
 
 import gradio as gr
+import imageio
 import numpy as np
 import torch
 from loguru import logger
@@ -46,6 +50,7 @@ def _enqueue_job(
     base_seed: int,
     audio_array: np.ndarray,
     sample_rate: int,
+    result_dir: str,
 ):
     payload = {
         "cmd": "start",
@@ -56,6 +61,7 @@ def _enqueue_job(
         "base_seed": base_seed,
         "audio_array": audio_array,
         "sample_rate": sample_rate,
+        "result_dir": result_dir,
     }
     job_queue.put(payload)
 
@@ -71,33 +77,42 @@ def _launch_flashtalk_worker(
     ctx = mp_get_context("spawn")
     world_size = len(gpu_ids.split(","))
     processes = []
-    for rank in range(world_size):
-        proc = ctx.Process(
-            target=flashtalk_worker_loop,
-            args=(
-                rank,
-                world_size,
-                init_method,
-                job_queue,
-                result_queue,
-                ckpt_dir,
-                wav2vec_dir,
-                gpu_ids,
-            ),
-        )
-        proc.start()
-        processes.append(proc)
+    prev_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids
+    try:
+        for rank in range(world_size):
+            proc = ctx.Process(
+                target=flashtalk_worker_loop,
+                args=(
+                    rank,
+                    world_size,
+                    init_method,
+                    job_queue,
+                    result_queue,
+                    ckpt_dir,
+                    wav2vec_dir,
+                    gpu_ids,
+                ),
+            )
+            proc.start()
+            processes.append(proc)
+    finally:
+        if prev_visible is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = prev_visible
     return processes
 
 
-def _format_history(history, system_prompt: str):
+def _format_history(history, system_prompt: str, audio_path: Optional[str] = None):
     messages = [{"role": "system", "content": [{"type": "text", "text": system_prompt}]}]
-    for item in history:
-        if isinstance(item["content"], str):
-            messages.append({"role": item["role"], "content": item["content"]})
-        elif item["role"] == "user" and isinstance(item["content"], (list, tuple)):
-            file_path = item["content"][0]
-            messages.append({"role": item["role"], "content": [{"type": "audio", "audio": file_path}]})
+    for user_msg, assistant_msg in history:
+        if user_msg and user_msg != "[audio]":
+            messages.append({"role": "user", "content": user_msg})
+        if assistant_msg:
+            messages.append({"role": "assistant", "content": assistant_msg})
+    if audio_path:
+        messages.append({"role": "user", "content": [{"type": "audio", "audio": audio_path}]})
     return messages
 
 
@@ -120,7 +135,46 @@ def _predict(model, processor, messages, voice: str, use_audio_in_video: bool):
     return response, np.array(audio, dtype=np.float32)
 
 
-def _stream_frames(result_queue, job_id: str, poll_interval: float = 0.1):
+def _write_wav(path: str, audio: np.ndarray, sample_rate: int):
+    audio = np.asarray(audio).flatten()
+    audio = np.clip(audio, -1.0, 1.0)
+    pcm16 = (audio * 32767.0).astype(np.int16)
+    with wave.open(path, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm16.tobytes())
+
+
+def _mux_av(video_path: str, audio_path: str, output_path: str):
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        video_path,
+        "-i",
+        audio_path,
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-shortest",
+        output_path,
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _stream_frames(
+    result_queue,
+    job_id: str,
+    result_path: str,
+    audio_array: np.ndarray,
+    sample_rate: int,
+    poll_interval: float = 0.1,
+):
+    writer = None
+    video_only_path = result_path.replace(".mp4", ".video.mp4")
+    audio_path = result_path.replace(".mp4", ".wav")
     while True:
         try:
             payload = result_queue.get(timeout=poll_interval)
@@ -131,9 +185,56 @@ def _stream_frames(result_queue, job_id: str, poll_interval: float = 0.1):
         if payload.get("type") == "frame":
             frame = payload.get("frame")
             if frame is not None:
+                if writer is None:
+                    fps = payload.get("fps", 25)
+                    writer = imageio.get_writer(
+                        video_only_path,
+                        format="mp4",
+                        mode="I",
+                        fps=fps,
+                        codec="h264",
+                        ffmpeg_params=["-bf", "0"],
+                    )
+                writer.append_data(frame)
                 yield Image.fromarray(frame)
         elif payload.get("type") == "done":
+            if writer is not None:
+                writer.close()
+            try:
+                _write_wav(audio_path, audio_array, sample_rate)
+                _mux_av(video_only_path, audio_path, result_path)
+                if os.path.exists(video_only_path):
+                    os.remove(video_only_path)
+                if os.path.exists(audio_path):
+                    os.remove(audio_path)
+            except Exception as exc:
+                logger.warning("Failed to mux audio into video: {}", exc)
             return
+
+
+def _create_result_path() -> str:
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    base_dir = os.path.join(project_root, "results")
+    os.makedirs(base_dir, exist_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
+    result_dir = os.path.join(base_dir, ts)
+    os.makedirs(result_dir, exist_ok=True)
+    return os.path.join(result_dir, f"{ts}.mp4")
+
+
+def _shutdown_workers(job_queue, processes, timeout: float = 10.0):
+    if job_queue is not None:
+        try:
+            job_queue.put({"cmd": "shutdown"})
+        except Exception:
+            pass
+    for proc in processes:
+        proc.join(timeout=timeout)
+    for proc in processes:
+        if proc.is_alive():
+            proc.terminate()
+    for proc in processes:
+        proc.join(timeout=timeout)
 
 
 def build_demo(
@@ -155,6 +256,11 @@ def build_demo(
             with gr.Column(scale=1):
                 system_prompt_box = gr.Textbox(label="System prompt", value=system_prompt)
                 voice_box = gr.Dropdown(label="Voice", choices=["Chelsie", "Ethan"], value=voice)
+                cond_image = gr.Image(
+                    label="FlashTalk condition image",
+                    type="filepath",
+                    value=flashtalk_cond_image,
+                )
                 user_text = gr.Textbox(label="User text")
                 user_audio = gr.Audio(label="User audio", type="filepath")
                 send_btn = gr.Button("Send")
@@ -170,13 +276,15 @@ def build_demo(
 
         state = gr.State([])
 
-        def on_send(text, audio, history, system_prompt_value, voice_value):
+        def on_send(text, audio, history, system_prompt_value, voice_value, cond_image_path):
+            if history is None:
+                history = []
             if text:
-                history.append({"role": "user", "content": text})
+                history.append((text, None))
             if audio:
-                history.append({"role": "user", "content": (audio,)})
+                history.append(("[audio]", None))
 
-            formatted = _format_history(history, system_prompt_value)
+            formatted = _format_history(history, system_prompt_value, audio)
             response_text, response_audio = _predict(
                 model,
                 processor,
@@ -184,25 +292,39 @@ def build_demo(
                 voice_value,
                 use_audio_in_video,
             )
-            history.append({"role": "assistant", "content": response_text})
+            if history:
+                user_msg, _ = history[-1]
+                history[-1] = (user_msg, response_text)
+            else:
+                history.append(("", response_text))
             job_id = f"job_{int(time.time() * 1000)}_{os.getpid()}"
+            if not cond_image_path:
+                cond_image_path = flashtalk_cond_image
+            result_path = _create_result_path()
             _enqueue_job(
                 job_queue,
                 job_id,
-                flashtalk_cond_image,
+                cond_image_path,
                 flashtalk_prompt,
                 flashtalk_audio_mode,
                 flashtalk_seed,
                 response_audio,
                 24000,
+                os.path.dirname(result_path),
             )
             yield history, None
-            for frame in _stream_frames(result_queue, job_id):
+            for frame in _stream_frames(
+                result_queue,
+                job_id,
+                result_path,
+                response_audio,
+                24000,
+            ):
                 yield history, frame
 
         send_btn.click(
             on_send,
-            inputs=[user_text, user_audio, state, system_prompt_box, voice_box],
+            inputs=[user_text, user_audio, state, system_prompt_box, voice_box, cond_image],
             outputs=[chat_box, stream_frame],
         )
 
@@ -277,22 +399,22 @@ if __name__ == "__main__":
         )
     else:
         raise RuntimeError("FlashTalk worker must be started in-process for direct IPC.")
-    model, processor = _load_model_processor(args.thinker_ckpt, args.thinker_device)
-    demo = build_demo(
-        model=model,
-        processor=processor,
-        system_prompt=args.system_prompt,
-        voice=args.voice,
-        use_audio_in_video=args.use_audio_in_video,
-        flashtalk_cond_image=args.flashtalk_cond_image,
-        flashtalk_prompt=args.flashtalk_prompt,
-        flashtalk_audio_mode=args.flashtalk_audio_mode,
-        flashtalk_seed=args.flashtalk_seed,
-        job_queue=job_queue,
-        result_queue=result_queue,
-    )
-    demo.launch(server_name=args.host, server_port=args.port)
-    if job_queue is not None:
-        job_queue.put({"cmd": "shutdown"})
-    for proc in flashtalk_procs:
-        proc.terminate()
+    atexit.register(_shutdown_workers, job_queue, flashtalk_procs)
+    try:
+        model, processor = _load_model_processor(args.thinker_ckpt, args.thinker_device)
+        demo = build_demo(
+            model=model,
+            processor=processor,
+            system_prompt=args.system_prompt,
+            voice=args.voice,
+            use_audio_in_video=args.use_audio_in_video,
+            flashtalk_cond_image=args.flashtalk_cond_image,
+            flashtalk_prompt=args.flashtalk_prompt,
+            flashtalk_audio_mode=args.flashtalk_audio_mode,
+            flashtalk_seed=args.flashtalk_seed,
+            job_queue=job_queue,
+            result_queue=result_queue,
+        )
+        demo.launch(server_name=args.host, server_port=args.port)
+    finally:
+        _shutdown_workers(job_queue, flashtalk_procs)

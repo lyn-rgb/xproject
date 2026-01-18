@@ -1224,6 +1224,32 @@ Running on local: http://127.0.0.1:7860/
 
 复制该链接，并将其粘贴到浏览器中，即可访问网页演示，在网页中您可以输入文本、上传音频、图像和视频，以及切换输出音色类型等功能。
 
+### Thinker + FlashTalk 多进程联动（本地 IPC）
+
+此模式在同一入口脚本内启动 Thinker（GPU0）与 FlashTalk 多卡推理（GPU1-7），通过 `multiprocessing` 队列进行进程间通信，不需要额外的后端服务或文件队列。
+
+**准备模型**（示例路径）：
+- Thinker：`models/Qwen2.5-Omni-7B`
+- FlashTalk：`models/SoulX-FlashTalk-14B`
+- Wav2Vec：`models/chinese-wav2vec2-base`
+
+**启动命令**：
+```bash
+python thinker_flash_talk_demo.py \
+  --thinker_ckpt models/Qwen2.5-Omni-7B \
+  --thinker_device cuda:0 \
+  --start_flashtalk_worker \
+  --flashtalk_ckpt models/SoulX-FlashTalk-14B \
+  --flashtalk_wav2vec models/chinese-wav2vec2-base \
+  --flashtalk_gpus 1,2,3,4,5,6,7 \
+  --flashtalk_dist_port 29501
+```
+
+**说明**：
+- Thinker 固定使用 `cuda:0`，FlashTalk 使用 `1-7`；两者不可重叠。
+- FlashTalk 是 `torch.distributed` 多进程推理，主进程会自动拉起子进程。
+- FlashTalk 条件图可在 Gradio 界面选择（默认使用 `--flashtalk_cond_image`）。
+
 
 ### 实时交互
 

@@ -1,4 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import gc
 import os
 import time
 from collections import deque
@@ -19,22 +20,11 @@ from flash_talk.inference import (
 )
 
 
-def _init_dist(rank: int, world_size: int, init_method: str):
-    if dist.is_initialized():
-        return
-    dist.init_process_group(
-        backend="nccl",
-        init_method=init_method,
-        rank=rank,
-        world_size=world_size,
-    )
-
-
-def _get_pipeline_cached(cache: Dict, ckpt_dir: str, wav2vec_dir: str):
+def _get_pipeline_cached(cache: Dict, world_size: int, ckpt_dir: str, wav2vec_dir: str):
     cache_key = (ckpt_dir, wav2vec_dir)
     if cache_key in cache:
         return cache[cache_key]
-    pipeline = get_pipeline(world_size=dist.get_world_size(), ckpt_dir=ckpt_dir, wav2vec_dir=wav2vec_dir)
+    pipeline = get_pipeline(world_size=world_size, ckpt_dir=ckpt_dir, wav2vec_dir=wav2vec_dir)
     cache[cache_key] = pipeline
     return pipeline
 
@@ -143,10 +133,18 @@ def worker_loop(
 ):
     os.environ["CUDA_VISIBLE_DEVICES"] = cuda_visible
     torch.cuda.set_device(rank)
-    _init_dist(rank, world_size, init_method)
+    if not dist.is_initialized():
+        if init_method.startswith("tcp://"):
+            _, addr = init_method.split("://", 1)
+            host, port = addr.split(":")
+            os.environ.setdefault("MASTER_ADDR", host)
+            os.environ.setdefault("MASTER_PORT", port)
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world_size)
+        os.environ["LOCAL_RANK"] = str(rank)
 
     pipeline_cache: Dict = {}
-    pipeline = _get_pipeline_cached(pipeline_cache, ckpt_dir, wav2vec_dir)
+    pipeline = _get_pipeline_cached(pipeline_cache, world_size, ckpt_dir, wav2vec_dir)
 
     while True:
         payload = None
@@ -156,3 +154,8 @@ def worker_loop(
         if payload is None or payload.get("cmd") == "shutdown":
             return
         _run_generation(payload, pipeline, rank, result_queue)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        gc.collect()

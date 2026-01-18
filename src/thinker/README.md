@@ -1224,6 +1224,32 @@ Running on local: http://127.0.0.1:7860/
 
 Copy this link and paste it into your browser to access the web UI, where you can interact with the model by inputting text, uploading audios/images/videos, changing voice type or using any other provided functionalities.
 
+### Thinker + FlashTalk Multiprocess Demo (Local IPC)
+
+This mode starts Thinker on GPU0 and FlashTalk on GPUs 1-7 in the same launcher script, using `multiprocessing` queues for IPC (no HTTP service or file queue).
+
+**Model paths (examples)**:
+- Thinker: `models/Qwen2.5-Omni-7B`
+- FlashTalk: `models/SoulX-FlashTalk-14B`
+- Wav2Vec: `models/chinese-wav2vec2-base`
+
+**Launch command**:
+```bash
+python thinker_flash_talk_demo.py \
+  --thinker_ckpt models/Qwen2.5-Omni-7B \
+  --thinker_device cuda:0 \
+  --start_flashtalk_worker \
+  --flashtalk_ckpt models/SoulX-FlashTalk-14B \
+  --flashtalk_wav2vec models/chinese-wav2vec2-base \
+  --flashtalk_gpus 1,2,3,4,5,6,7 \
+  --flashtalk_dist_port 29501
+```
+
+**Notes**:
+- Thinker uses `cuda:0`; FlashTalk uses `1-7` and must not overlap.
+- FlashTalk runs with `torch.distributed` multiprocess workers.
+- The FlashTalk condition image can be selected in the Gradio UI (default is `--flashtalk_cond_image`).
+
 
 ### Real-Time Interaction
 The streaming Real-time interaction with Qwen2.5-Omni is available now, please visit [Qwen Chat](https://chat.qwen.ai/) and select the voice/video calls in the chat box to experience. 
