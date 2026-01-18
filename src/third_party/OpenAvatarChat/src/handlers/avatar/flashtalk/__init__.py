@@ -1,0 +1,1 @@
+"""FlashTalk avatar handler package."""
