@@ -1,21 +1,25 @@
 import argparse
-import io
-import json
 import os
-import subprocess
-import tempfile
+import sys
 import time
 from typing import Optional
 
 import gradio as gr
 import numpy as np
 import torch
-import soundfile as sf
 from loguru import logger
 from PIL import Image
+from torch.multiprocessing import get_context as mp_get_context
 from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
 
 from qwen_omni_utils import process_mm_info
+
+
+_AVATAR_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "avatar"))
+if _AVATAR_ROOT not in sys.path:
+    sys.path.append(_AVATAR_ROOT)
+
+from flash_talk_mp_worker import worker_loop as flashtalk_worker_loop
 
 
 def _load_model_processor(checkpoint_path: str, device: str):
@@ -33,72 +37,57 @@ def _load_model_processor(checkpoint_path: str, device: str):
     return model, processor
 
 
-def _save_audio_to_wav(audio: np.ndarray, sample_rate: int) -> str:
-    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
-    wav_io = io.BytesIO()
-    sf.write(wav_io, audio, samplerate=sample_rate, format="WAV")
-    wav_io.seek(0)
-    tmp_dir = tempfile.mkdtemp(prefix="thinker_audio_")
-    audio_path = os.path.join(tmp_dir, "audio.wav")
-    with open(audio_path, "wb") as f:
-        f.write(wav_io.read())
-    return audio_path
-
-
 def _enqueue_job(
-    queue_dir: str,
-    ckpt_dir: str,
-    wav2vec_dir: str,
+    job_queue,
+    job_id: str,
     cond_image_path: str,
-    audio_path: str,
     input_prompt: str,
     audio_encode_mode: str,
     base_seed: int,
+    audio_array: np.ndarray,
+    sample_rate: int,
 ):
-    jobs_dir = os.path.join(queue_dir, "jobs")
-    results_dir = os.path.join(queue_dir, "results")
-    os.makedirs(jobs_dir, exist_ok=True)
-    os.makedirs(results_dir, exist_ok=True)
-
-    job_id = f"job_{int(time.time() * 1000)}_{os.getpid()}"
-    output_dir = os.path.join(results_dir, job_id)
-    os.makedirs(output_dir, exist_ok=True)
     payload = {
         "cmd": "start",
-        "ckpt_dir": ckpt_dir,
-        "wav2vec_dir": wav2vec_dir,
+        "job_id": job_id,
         "cond_image_path": cond_image_path,
-        "audio_path": audio_path,
         "input_prompt": input_prompt,
         "audio_encode_mode": audio_encode_mode,
         "base_seed": base_seed,
-        "output_dir": output_dir,
+        "audio_array": audio_array,
+        "sample_rate": sample_rate,
     }
-    tmp_path = os.path.join(jobs_dir, f"{job_id}.json.tmp")
-    job_path = os.path.join(jobs_dir, f"{job_id}.json")
-    with open(tmp_path, "w") as f:
-        json.dump(payload, f)
-    os.replace(tmp_path, job_path)
-    return output_dir
+    job_queue.put(payload)
 
 
 def _launch_flashtalk_worker(
-    queue_dir: str,
+    ckpt_dir: str,
+    wav2vec_dir: str,
     gpu_ids: str,
+    job_queue,
+    result_queue,
+    init_method: str,
 ):
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = gpu_ids
-    cmd = [
-        "python",
-        "-m",
-        "torch.distributed.run",
-        f"--nproc_per_node={len(gpu_ids.split(','))}",
-        "src/avatar/flash_talk_queue_worker.py",
-        "--queue_dir",
-        queue_dir,
-    ]
-    logger.info("Launching FlashTalk worker: {}", " ".join(cmd))
-    return subprocess.Popen(cmd, env=env)
+    ctx = mp_get_context("spawn")
+    world_size = len(gpu_ids.split(","))
+    processes = []
+    for rank in range(world_size):
+        proc = ctx.Process(
+            target=flashtalk_worker_loop,
+            args=(
+                rank,
+                world_size,
+                init_method,
+                job_queue,
+                result_queue,
+                ckpt_dir,
+                wav2vec_dir,
+                gpu_ids,
+            ),
+        )
+        proc.start()
+        processes.append(proc)
+    return processes
 
 
 def _format_history(history, system_prompt: str):
@@ -131,19 +120,20 @@ def _predict(model, processor, messages, voice: str, use_audio_in_video: bool):
     return response, np.array(audio, dtype=np.float32)
 
 
-def _stream_frames(output_dir: str, poll_interval: float = 0.1):
-    frame_dir = os.path.join(output_dir, "frames")
-    done_path = os.path.join(output_dir, "DONE")
-    frame_idx = 0
+def _stream_frames(result_queue, job_id: str, poll_interval: float = 0.1):
     while True:
-        frame_path = os.path.join(frame_dir, f"frame_{frame_idx:06d}.jpg")
-        if os.path.exists(frame_path):
-            yield Image.open(frame_path)
-            frame_idx += 1
+        try:
+            payload = result_queue.get(timeout=poll_interval)
+        except Exception:
             continue
-        if os.path.exists(done_path):
+        if payload.get("job_id") != job_id:
+            continue
+        if payload.get("type") == "frame":
+            frame = payload.get("frame")
+            if frame is not None:
+                yield Image.fromarray(frame)
+        elif payload.get("type") == "done":
             return
-        time.sleep(poll_interval)
 
 
 def build_demo(
@@ -152,13 +142,12 @@ def build_demo(
     system_prompt: str,
     voice: str,
     use_audio_in_video: bool,
-    flashtalk_ckpt_dir: str,
-    flashtalk_wav2vec_dir: str,
     flashtalk_cond_image: str,
     flashtalk_prompt: str,
     flashtalk_audio_mode: str,
     flashtalk_seed: int,
-    queue_dir: str,
+    job_queue,
+    result_queue,
 ):
     with gr.Blocks(title="Thinker + FlashTalk") as demo:
         gr.Markdown("# Thinker Chat + FlashTalk Streaming Avatar")
@@ -196,19 +185,19 @@ def build_demo(
                 use_audio_in_video,
             )
             history.append({"role": "assistant", "content": response_text})
-            audio_path = _save_audio_to_wav(response_audio, 24000)
-            output_dir = _enqueue_job(
-                queue_dir,
-                flashtalk_ckpt_dir,
-                flashtalk_wav2vec_dir,
+            job_id = f"job_{int(time.time() * 1000)}_{os.getpid()}"
+            _enqueue_job(
+                job_queue,
+                job_id,
                 flashtalk_cond_image,
-                audio_path,
                 flashtalk_prompt,
                 flashtalk_audio_mode,
                 flashtalk_seed,
+                response_audio,
+                24000,
             )
             yield history, None
-            for frame in _stream_frames(output_dir):
+            for frame in _stream_frames(result_queue, job_id):
                 yield history, frame
 
         send_btn.click(
@@ -238,8 +227,8 @@ def _parse_args():
     parser.add_argument("--flashtalk_audio_mode", type=str, default="stream")
     parser.add_argument("--flashtalk_seed", type=int, default=9999)
 
-    parser.add_argument("--queue_dir", type=str, default="tmp/flashtalk_queue")
     parser.add_argument("--start_flashtalk_worker", action="store_true")
+    parser.add_argument("--flashtalk_dist_port", type=int, default=29501)
     parser.add_argument("--flashtalk_gpus", type=str, default="1,2,3,4,5,6,7")
 
     parser.add_argument("--host", type=str, default="0.0.0.0")
@@ -247,14 +236,47 @@ def _parse_args():
     return parser.parse_args()
 
 
+def _parse_gpu_index(device: str) -> Optional[int]:
+    if device.startswith("cuda:"):
+        try:
+            return int(device.split(":")[-1])
+        except ValueError:
+            return None
+    return None
+
+
+def _assert_gpu_partition(thinker_device: str, flashtalk_gpus: str):
+    thinker_idx = _parse_gpu_index(thinker_device)
+    if thinker_idx is None:
+        return
+    flashtalk_set = {int(x) for x in flashtalk_gpus.split(",") if x.strip().isdigit()}
+    if thinker_idx in flashtalk_set:
+        raise ValueError(
+            f"Thinker device cuda:{thinker_idx} overlaps with FlashTalk GPUs {sorted(flashtalk_set)}"
+        )
+
+
 if __name__ == "__main__":
     args = _parse_args()
-    flashtalk_proc: Optional[subprocess.Popen] = None
+    _assert_gpu_partition(args.thinker_device, args.flashtalk_gpus)
+    flashtalk_procs = []
+    job_queue = None
+    result_queue = None
     if args.start_flashtalk_worker:
-        flashtalk_proc = _launch_flashtalk_worker(
-            queue_dir=args.queue_dir,
+        ctx = mp_get_context("spawn")
+        job_queue = ctx.Queue()
+        result_queue = ctx.Queue()
+        init_method = f"tcp://127.0.0.1:{args.flashtalk_dist_port}"
+        flashtalk_procs = _launch_flashtalk_worker(
+            ckpt_dir=args.flashtalk_ckpt,
+            wav2vec_dir=args.flashtalk_wav2vec,
             gpu_ids=args.flashtalk_gpus,
+            job_queue=job_queue,
+            result_queue=result_queue,
+            init_method=init_method,
         )
+    else:
+        raise RuntimeError("FlashTalk worker must be started in-process for direct IPC.")
     model, processor = _load_model_processor(args.thinker_ckpt, args.thinker_device)
     demo = build_demo(
         model=model,
@@ -262,14 +284,15 @@ if __name__ == "__main__":
         system_prompt=args.system_prompt,
         voice=args.voice,
         use_audio_in_video=args.use_audio_in_video,
-        flashtalk_ckpt_dir=args.flashtalk_ckpt,
-        flashtalk_wav2vec_dir=args.flashtalk_wav2vec,
         flashtalk_cond_image=args.flashtalk_cond_image,
         flashtalk_prompt=args.flashtalk_prompt,
         flashtalk_audio_mode=args.flashtalk_audio_mode,
         flashtalk_seed=args.flashtalk_seed,
-        queue_dir=args.queue_dir,
+        job_queue=job_queue,
+        result_queue=result_queue,
     )
     demo.launch(server_name=args.host, server_port=args.port)
-    if flashtalk_proc is not None:
-        flashtalk_proc.terminate()
+    if job_queue is not None:
+        job_queue.put({"cmd": "shutdown"})
+    for proc in flashtalk_procs:
+        proc.terminate()
